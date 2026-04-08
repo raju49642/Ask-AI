@@ -74,7 +74,7 @@ Ask-AI/
 │ └── icon/
 │
 ├── README.md
-
+├── .gitignore
 
 ---
 
