@@ -43,6 +43,40 @@ function getWindow(segments, index, size = 5) {
     return segments.slice(start, end);
 }
 
+// ================= LLM TRANSPORT HELPERS =================
+async function callGroqChat(body, { maxRetries = 4, timeout = 300000 } = {}) {
+    const url = "https://api.groq.com/openai/v1/chat/completions";
+    const headers = {
+        Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+        "Content-Type": "application/json"
+    };
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        const start = Date.now();
+        try {
+            const resp = await axios.post(url, body, { headers, timeout });
+            console.log(`[LLM] success (attempt ${attempt}) status=${resp.status} time=${Date.now()-start}ms`);
+            return resp;
+            } catch (err) {
+            const status = err.response?.status;
+            console.error(`[LLM] attempt ${attempt} failed status=${status || "-"} code=${err.code || "-"} msg=${err.message}`);
+                if (err.code === 'ECONNABORTED') console.error('[LLM] connection aborted (timeout)');
+            // Log limited response data for diagnosis (avoid leaking secrets)
+            if (err.response?.data) console.error("[LLM] resp.data:", typeof err.response.data === 'string' ? err.response.data.slice(0,200) : JSON.stringify(err.response.data).slice(0,400));
+
+            // Retry on gateway/network errors
+            if ((status === 502 || status === 503 || status === 504 || !err.response) && attempt < maxRetries) {
+                const delay = 1000 * Math.pow(2, attempt - 1); // 1s, 2s, 4s
+                console.log(`[LLM] retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries})`);
+                await new Promise(r => setTimeout(r, delay));
+                continue;
+            }
+
+            throw err;
+        }
+    }
+}
+
 
 // ================= MAIN ROUTE =================
 app.post("/ask", async (req, res) => {
@@ -207,7 +241,7 @@ app.post("/summary", async (req, res) => {
             fullText = segments.map(s => s.text).join(" ");
 
             // Trim to ~12000 chars to stay within LLM context limits
-            // ~12000 chars ≈ 3000 tokens — safe for llama3-70b with 800 output tokens
+            // ~12000 chars ≈ 3000 tokens — within the selected Groq model's context window
             if (fullText.length > 12000) {
                 fullText = fullText.slice(0, 12000) + "...";
             }
@@ -269,16 +303,16 @@ STRICT RULES
 
         // ── LLM Call ──
         const response = await axios.post(
-            "https://integrate.api.nvidia.com/v1/chat/completions",
+            "https://api.groq.com/openai/v1/chat/completions",
             {
-                model: "meta/llama3-70b-instruct",
+                model: "openai/gpt-oss-20b",
                 messages: [{ role: "user", content: prompt }],
                 max_tokens: 900,
                 temperature: 0.3   // lower = more factual, less hallucination
             },
             {
                 headers: {
-                    Authorization: `Bearer ${process.env.NVIDIA_API_KEY}`,
+                    Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
                     "Content-Type": "application/json"
                 }
             }
@@ -304,22 +338,17 @@ STRICT RULES
     }
 });
 
-        // ================= LLM CALL =================
-        const response = await axios.post(
-            "https://integrate.api.nvidia.com/v1/chat/completions",
-            {
-                model: "meta/llama3-70b-instruct",
-                messages: [{ role: "user", content: prompt }],
-                max_tokens: 800,
-                temperature: 0.4
-            },
-            {
-                headers: {
-                    Authorization: `Bearer ${process.env.NVIDIA_API_KEY}`,
-                    "Content-Type": "application/json"
-                }
-            }
-        );
+        // ================= LLM CALL (with transport retries) =================
+        console.log(`[LLM] /ask prompt length=${prompt.length} chars historyLength=${historyText.length}`);
+
+        const body = {
+            model: "openai/gpt-oss-20b",
+            messages: [{ role: "user", content: prompt }],
+            max_tokens: 800,
+            temperature: 0.4
+        };
+
+        const response = await callGroqChat(body, { maxRetries: 4, timeout: 300000 });
 
         const answer = response.data.choices?.[0]?.message?.content?.trim() || "No response";
 
